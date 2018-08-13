@@ -1,0 +1,592 @@
+#!/usr/bin/env python
+"""
+Script for provisioning a new install of Ubuntu 16.04 (xenial) from scratch
+"""
+
+import argparse
+from itertools import chain
+import grp
+import json
+import logging
+import os
+from os.path import join as pjoin
+from shutil import copyfile
+from subprocess import Popen, PIPE, STDOUT
+from textwrap import dedent
+
+# settings -- should not need to change
+logging.basicConfig(format='[%(levelname)s]: %(message)s', level=logging.INFO)
+HOME = os.environ['HOME']
+USER = os.environ['USER']
+BASHRC = pjoin(HOME, '.bashrc')
+ALIASES = pjoin(HOME, '.bash_aliases')
+CONDA_DEST = pjoin(HOME, 'miniconda3')
+CONDA_ENV = pjoin(CONDA_DEST, 'etc', 'profile.d', 'conda.sh')
+BASE_UBUNTU_PKGS = [
+    'apt-utils',
+    'autoconf',
+    'bzip2',
+    'build-essential',
+    'ca-certificates',
+    'coreutils',
+    'curl',
+    'libtool',
+    'locales',
+    'pkg-config',
+    'rsync',
+    'tar',
+    'unzip',
+    'wget',
+]
+
+# may need to be updated these URLs as packages upgrade/versions change
+ATOM = "https://atom.io/download/deb"
+DOCKER = "https://download.docker.com/linux/ubuntu"
+FREESURFER = "https://dl.dropbox.com/s/nnzcfttc41qvt31/recon-all-freesurfer6-3.min.tgz"  # noqa
+MINICONDA = "https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh"  # noqa
+SLACK = "https://downloads.slack-edge.com/linux_releases/slack-desktop-3.2.1-amd64.deb"  # noqa
+ZOTERO = "https://www.zotero.org/download/client/dl?channel=release&platform=linux-x86_64&version=5.0.53"  # noqa
+
+# can modify what packages to install for e.g., python if desired
+EXTRA_UBUNTU_PKGS = [
+    'datalad',
+    'dcm2niix',
+    'git',
+    'git-annex-standalone',
+    'gnupg',
+    'imagemagick',
+    'parallel',
+    'pdftk',
+    'qpdfview',
+    'texlive-latex-base',
+    'tree',
+    'vlc',
+    'xsel',
+]
+
+CONDA_PKGS = [
+    'flake8',
+    'h5py',
+    'ipython',
+    'jupyter',
+    'jupyterlab',
+    'matplotlib',
+    'networkx',
+    'nibabel',
+    'nilearn',
+    'numpy',
+    'pandas',
+    'scipy',
+    'scikit-learn',
+    'seaborn',
+]
+
+PIP_PKGS = [
+    'bctpy',
+    'duecredit',
+    'neurodocker',
+    'pybids',
+]
+
+ATOM_PKGS = [
+    'busy-signal',
+    'file-icons',
+    'highlight-selected',
+    'intentions',
+    'language-matlab',
+    'language-restructuredtext',
+    'teletype',
+    'linter',
+    'linter-ui-default',
+    'linter-flake8',
+    'minimap',
+    'minimap-highlight-selected',
+    'atom-terminal',
+]
+
+
+def run(cmd, env={}, ignore_errors=False):
+    """
+    Runs command via subprocess and pipes output
+    Parameters
+    ----------
+    cmd : str
+        Command to be run
+    ignore_errors : bool, optional
+        Whether to ignore errors; if True, no warnings will be raised if `cmd`
+        returned non-zero exit code. Default: False
+    References
+    ----------
+    .. [1] `FreeSurfer recon-all BIDS App
+       <https://github.com/BIDS-Apps/freesurfer>`_
+    """
+    merged_env = os.environ.copy()
+    merged_env.update(env)
+    logging.info('Command: {}'.format(cmd))
+    proc = Popen(cmd, stdout=PIPE, stderr=STDOUT, shell=True, env=merged_env)
+    while True:
+        line = proc.stdout.readline()
+        line = str(line)[:-1]
+        if line == '' and proc.poll() is not None:
+            break
+        logging.debug(line)
+    if proc.returncode != 0 and not ignore_errors:
+        raise ValueError('Non zero return code: {}'.format(proc.returncode))
+
+
+def update_base():
+    """ Installs some basic OS updates
+    """
+    logging.info('Installing basic OS updates')
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends {}'
+        .format(' '.join(BASE_UBUNTU_PKGS)))
+    run('sudo apt-get clean')
+
+
+def install_neurodebian():
+    """ Installs Neurodebian (http://neuro.debian.net/)
+    """
+    logging.info('Installing Neurodebian')
+    run('wget -q -O- http://neuro.debian.net/lists/xenial.us-nh.full '
+        '| sudo tee /etc/apt/sources.list.d/neurodebian.sources.list')
+    run('sudo apt-key adv --recv-keys --keyserver '
+        'hkp://pool.sks-keyservers.net:80 0xA5D32F012649A5A9')
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get upgrade -yq')
+
+
+def check_neurodebian(pckg=''):
+    """
+    Checks to see if Neurodebian has been installed in support of `pckg`
+    Parameters
+    ----------
+    pckg : str, optional
+        Package that requires Neurodebian to install
+    Returns
+    -------
+    returncode : bool
+        0 if Neurodebian installed properly, 1 if not
+    """
+    def get_repos(fn):
+        with open(fn, 'r') as src:
+            repos = src.readlines()
+        return [rep.strip() for rep in repos if rep.startswith('deb')]
+    neurodeb_repos = [
+        'deb http://neuro.debian.net/debian xenial main contrib non-free',
+        'deb http://neuro.debian.net/debian data main contrib non-free'
+    ]
+    repos = list(chain.from_iterable([get_repos(os.path.join(dp, f)) for
+                                      dp, dn, fnames in os.walk('/etc/apt')
+                                      for f in fnames if f.endswith('list')]))
+    returncode = int(any(d not in repos for d in neurodeb_repos))
+    if returncode != 0:
+        logging.warn('Neurodebian not set up properly; cannot install {}'
+                     .format(str(pckg)))
+    return returncode
+
+
+def install_miniconda():
+    """ Installs miniconda (https://conda.io/docs/index.html)
+    """
+    logging.info('Installing Miniconda')
+    conda_installer = '/tmp/miniconda.sh'
+    run('curl -fsSL --retry 5 -o {} {}'.format(conda_installer, MINICONDA))
+    run('bash {} -b -p {}'.format(conda_installer, CONDA_DEST))
+    os.remove(conda_installer)
+    with open(BASHRC, 'a') as dest:
+        dest.write('\n. {}\n'.format(CONDA_ENV))
+        dest.write('conda activate base\n')
+    src_conda = '. {} && '.format(CONDA_ENV)
+    run(src_conda + 'conda update -yq -n base conda')
+    run(src_conda + 'conda config --system --append channels conda-forge')
+    run(src_conda + 'conda config --system --set auto_update_conda false')
+    run(src_conda + 'conda config --system --set show_channel_urls true')
+    run(src_conda + 'conda clean -tipsy')
+
+
+def check_miniconda():
+    """ Checks for conda installation
+    """
+    return 0 if os.path.exists(CONDA_ENV) else 1
+
+
+def install_ubuntu_packages(name=None, email=None):
+    """ Installs miscellaneous utilities and sets them up
+    """
+    logging.info('Installing miscellaneous utilities')
+    if check_neurodebian('miscellaneous utilities') != 0:
+        return
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends {}'
+        .format(' '.join(EXTRA_UBUNTU_PKGS)))
+
+    # some helpful git configurations
+    if 'git' in EXTRA_UBUNTU_PKGS:
+        os.makedirs(pjoin(HOME, 'gitrepos'))
+        git_config = [
+            'alias.sdiff "!git diff && git submodule foreach \'git diff\'"',
+            'alias.spush "push --recurse-submodules=on-demand"',
+            'alias.supdate "submodule update --remote --merge"',
+            'credential.helper "cache --timeout=7200"',
+            'core.editor "nano -r 72"'
+        ]
+        if name is not None:
+            git_config.append('user.name "{}"'.format(name))
+        if email is not None:
+            git_config.append('user.email "{}"'.format(email))
+        for cmd in git_config:
+            run('git config --global {}'.format(cmd))
+
+    # useful functions to .bash_aliases
+    with open(ALIASES, 'a') as dest:
+        dest.write(dedent("""\
+            function decrypt_to_clip() {
+                gpg --decrypt $1 | xsel --clipboard
+            }
+
+            function from_clip() {
+                xsel --clipboard
+                xsel -cb
+            }
+            """))
+
+
+def install_python_modules():
+    """ Installs some useful Python modules in the conda base environment
+    """
+    logging.info('Installing scientific Python modules')
+    src_conda = '. {} && '.format(CONDA_ENV)
+    run(src_conda + 'conda activate base && conda install -yq {}'
+        .format(' '.join(CONDA_PKGS)))
+    run(src_conda + 'conda activate base && pip install {}'
+        .format(' '.join(PIP_PKGS)))
+
+
+def install_afni():
+    """ Installs AFNI (https://afni.nimh.nih.gov/)
+    """
+    logging.info('Installing AFNI')
+    if check_neurodebian('AFNI') != 0:
+        return
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends afni')
+    with open(BASHRC, 'a') as dest:
+        dest.write('source /etc/afni/afni.sh\n')
+
+
+def install_fsl():
+    """ Installs FSL (https://fsl.fmrib.ox.ac.uk/fsl/fslwiki)
+    """
+    logging.info('Installing FSL')
+    if check_neurodebian('FSL') != 0:
+        return
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends fsl-complete=5.0\*')
+    with open(BASHRC, 'a') as dest:
+        dest.write('export FSLDIR=/usr/share/fsl/5.0\n')
+        dest.write('source /etc/fsl/5.0/fsl.sh\n')
+
+
+def install_freesurfer(license=None):
+    """ Installs FreeSurfer (https://surfer.nmr.mgh.harvard.edu/)
+    """
+    logging.info('Installing Freesurfer')
+    freesurfer_dest = pjoin(HOME, 'tools', 'freesurfer')
+    freesurfer_reqs = [
+        'bc',
+        'libgomp1',
+        'libxmu6',
+        'libxt6',
+        'perl',
+        'tcsh'
+    ]
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends {}'
+        .format(' '.join(freesurfer_reqs)))
+    run('sudo apt-get clean')
+    if not os.path.exists(freesurfer_dest):
+        os.makedirs(freesurfer_dest)
+    run('curl -fsSL --retry 5 {} | tar -xz -C {} --strip-components 1'
+        .format(FREESURFER, freesurfer_dest))
+    with open(BASHRC, 'a') as dest:
+        dest.write('export FREESURFER_HOME={}\n'.format(freesurfer_dest))
+        dest.write('source $FREESURFER_HOME/SetUpFreeSurfer.sh\n')
+    if license is not None and os.path.exists(license):
+        copyfile(license, pjoin(freesurfer_dest, 'license.txt'))
+
+
+def install_ants():
+    """ Install ANTs (http://stnava.github.io/ANTs/)
+    """
+    logging.info('Installing ANTs')
+    if check_neurodebian('ANTs') != 0:
+        return
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends ants')
+
+
+def install_docker():
+    """ Installs Docker (https://www.docker.com/)
+    """
+    logging.info('Installing Docker')
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq apt-transport-https ca-certificates '
+        'software-properties-common')
+    run('curl -fsSL {}/gpg | sudo apt-key add -'.format(DOCKER))
+    run('sudo add-apt-repository "deb [arch=amd64] {} xenial stable"'
+        .format(DOCKER))
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq docker-ce')
+    # this errors if docker group somehow already exists
+    if 'docker' not in [g.gr_name for g in grp.getgrall()]:
+        run('sudo groupadd docker')
+    run('sudo usermod -G docker -a \'{}\''.format(USER))
+    run('sudo systemctl enable docker')
+
+
+def install_singularity():
+    """ Installs Singularity (https://www.sylabs.io/docs/)
+    """
+    logging.info('Installing Singularity')
+    if check_neurodebian('Singularity') != 0:
+        return
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends '
+        'singularity-container')
+
+
+def install_atom():
+    """ Installs Atom (https://atom.io/)
+    """
+    logging.info('Installing Atom')
+    atom_installer = '/tmp/atom.deb'
+    run('wget -q -O {} "{}"'.format(atom_installer, ATOM))
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq {}'.format(atom_installer))
+    os.remove(atom_installer)
+    run('/usr/bin/apm install -s {}'.format(' '.join(ATOM_PKGS)))
+
+
+def install_inkscape():
+    """ Installs Inkscape (https://inkscape.org/en/)
+    """
+    logging.info('Installing inkscape')
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends inkscape')
+
+
+def install_zotero():
+    """ Installs Zotero (https://www.zotero.org/)
+    """
+    logging.info('Installing Zotero')
+    zotero_installer = '/tmp/zotero.tar.bz2'
+    zotero_home = pjoin(HOME, 'tools', 'zotero')
+    run('wget -q -O {} "{}"'.format(zotero_installer, ZOTERO))
+    if not os.path.exists(zotero_home):
+        os.makedirs(zotero_home)
+    run('tar -xjf {} -C {} --strip-components 1'
+        .format(zotero_installer, zotero_home))
+    os.remove(zotero_installer)
+    run('{}'.format(pjoin(zotero_home, 'set_launcher_icon')))
+    zotero_desktop = pjoin(zotero_home, 'zotero.desktop')
+    launch_dest = pjoin(HOME, '.local', 'share', 'applications')
+    # TODO: fix adding zotero desktop to launch bar
+    run('desktop-file-install {}'.format(zotero_desktop))
+
+
+def install_slack():
+    """ Installs Slack (https://slack.com/)
+    """
+    logging.info('Installing Slack')
+    slack_installer = '/tmp/slack.deb'
+    run('wget -q -O {} "{}"'.format(slack_installer, SLACK))
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq {}'.format(slack_installer))
+    os.remove(slack_installer)
+
+
+def install_spotify():
+    """ Installs Spotify (https://www.spotify.com/)
+    """
+    logging.info('Installing Spotify')
+    run('sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 '
+        '--recv-keys 0DF731E45CE24F27EEEB1450EFDC8610341D9410 '
+        '931FF8E79F0876134EDDBDCCA87FF9DF48BF1C90')
+    run('echo deb http://repository.spotify.com stable non-free | '
+        'sudo tee /etc/apt/sources.list.d/spotify.list')
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get install -yq --no-install-recommends spotify-client')
+
+
+def fix_bashrc(username='\\u'):
+    """ Modifies .bashrc with some personal tweaks
+    """
+    with open(BASHRC, 'a') as dest:
+        dest.write('clear\n')
+        dest.write(dedent("""\
+        # ANSI color codes
+        RS="\[\033[0m\]"    # reset
+        FRED="\[\033[31m\]" # foreground red
+        FGRN="\[\033[32m\]" # foreground green
+        PS1="[\`if [[ \$? = "0" ]]; then echo ${FGRN}; else echo ${FRED}; fi\`{0}: $RS\W]$ "
+        """.format(username)))
+
+
+SOFTWARE = dict(
+    neurodebian=install_neurodebian,
+    miniconda=install_miniconda,
+    miscellaneous=install_ubuntu_packages,
+    scientific_python=install_python_modules,
+    afni=install_afni,
+    fsl=install_fsl,
+    freesurfer=install_freesurfer,
+    ants=install_ants,
+    docker=install_docker,
+    singularity=install_singularity,
+    atom=install_atom,
+    inkscape=install_inkscape,
+    zotero=install_zotero,
+    slack=install_slack,
+    spotify=install_spotify,
+)
+
+
+DEPENDENCIES = dict(
+    miniconda=dict(
+        requires=[
+            'scientific_python'
+        ],
+        install=install_miniconda,
+        check=check_miniconda
+    ),
+    neurodebian=dict(
+        requires=[
+            'afni', 'fsl', 'ants', 'singularity', 'miscellaneous'
+        ],
+        install=install_neurodebian,
+        check=check_neurodebian
+    )
+)
+
+
+def do_nothing():
+    """ Exactly what the name says
+    """
+    pass
+
+
+def check_requirements(requested, dependencies):
+    """
+    Checks if `requested` needs any `dependencies` and installs them
+
+    Parameters
+    ----------
+    requested : list
+        List of requested packages for installation
+    dependencies : dict-of-dict
+        List of packages that required dependency supported by `install_func`
+
+    Returns
+    -------
+    """
+
+    for dep, info in dependencies.iteritems():
+        if any([p in info['requires'] for p in requested]):
+            logging.info('Requested install requires {}'.format(dep))
+            if info.get('check', do_nothing)() != 0:
+                info.get('install', do_nothing)()
+            try:
+                requested.remove(dep)
+            except ValueError:
+                pass
+
+    return requested
+
+
+def get_config():
+    """ Loads config.json in script directory to get user-specified options
+    """
+
+    def byteify(inp):
+        """ We're working with the OS Python 2 here so we need to decode bytes
+        """
+        if isinstance(inp, dict):
+            return {byteify(key): byteify(value)
+                    for key, value in inp.iteritems()}
+        elif isinstance(inp, list):
+            return [byteify(element) for element in inp]
+        elif isinstance(inp, unicode):  # noqa
+            return inp.encode('utf-8')
+        else:
+            return inp
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(pjoin(script_dir, 'config.json'), 'r') as src:
+        options = json.load(src)
+
+    return byteify(options)
+
+
+def get_arguments():
+    """
+    Parses provided command-line arguments for provisioning
+
+    Returns
+    -------
+    opts : dict
+        Command-line specified options for provisioning
+    """
+
+    # TODO : add parser groups
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', dest='install', metavar='PACKAGE',
+                        action='store', nargs='+',
+                        choices=SOFTWARE.keys(), default=SOFTWARE.keys(),
+                        help='Select packages to install. Default: ALL')
+    parser.add_argument('--fs-license', metavar='PATH', type=os.path.abspath,
+                        help='Path to FreeSurfer license file, if it exists. '
+                        'If you do not already have a FreeSurfer license file '
+                        'you will need to register for one at: '
+                        'https://surfer.nmr.mgh.harvard.edu/registration.html')
+    parser.add_argument('--username', metavar='NAME', type=str, default=USER,
+                        help='Username to display in GNOME terminal prompt')
+    parser.add_argument('--name', metavar='NAME', type=str,
+                        help='Name for use in git configuration')
+    parser.add_argument('--email', metavar='EMAIL', type=str,
+                        help='Email for use in git configuration')
+    return vars(parser.parse_args())
+
+
+if __name__ == '__main__':
+    # get provided options
+    opts = get_arguments()
+    opts.update(get_config())
+
+    # get arguments for specific installs
+    arguments = dict(
+        freesurfer=dict(
+            license=opts['fs_license']
+        ),
+        miscellaneous=dict(
+            name=opts['name'],
+            email=opts['email']
+        )
+    )
+
+    # install required base OS updates
+    update_base()
+
+    # check package requirements
+    packages = check_requirements(opts['install'], DEPENDENCIES)
+
+    # install all requested packages
+    for pkg in packages:
+        SOFTWARE.get(pkg, do_nothing)(**arguments.get(pkg, {}))
+
+    # fix bashrc PS1 variable
+    fix_bashrc(username=opts['username'])
+
+    # one final update and upgrade
+    run('sudo apt-get update -qqq')
+    run('sudo apt-get upgrade -yq')
